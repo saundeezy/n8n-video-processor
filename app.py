@@ -2,6 +2,7 @@ import os
 import logging
 import requests
 import random
+import shutil
 from flask import Flask, request, jsonify, render_template, send_file
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -221,6 +222,7 @@ def download_file(filename):
 def execute_script_webhook():
     """
     Webhook endpoint for executing bash scripts from n8n
+    Fixed to handle video output correctly
     """
     try:
         if not request.is_json:
@@ -244,23 +246,51 @@ def execute_script_webhook():
         script_filename = f"script_{unique_id}.sh"
         script_path = os.path.join('/tmp', script_filename)
 
+        # Write the script
         with open(script_path, 'w') as f:
             f.write(script_content)
 
         os.chmod(script_path, 0o755)
 
+        # Execute the script with longer timeout for video processing
         result = subprocess.run(['bash', script_path], capture_output=True, text=True, timeout=600)
 
+        # Clean up script file
         os.remove(script_path)
 
+        # Define expected video path
+        video_source = '/tmp/n8n/simple_video/final_output.mp4'
+        
         if result.returncode == 0:
-            return jsonify({
-                'success': True,
-                'job_id': unique_id,
-                'output': result.stdout,
-                'video_path': '/tmp/n8n/simple_video/final_output.mp4',
-                'timestamp': datetime.utcnow().isoformat()
-            }), 200
+            # Check if video was created
+            if os.path.exists(video_source):
+                # Copy video to processed folder for download
+                processed_filename = f"video_{unique_id}.mp4"
+                processed_path = os.path.join(app.config['PROCESSED_FOLDER'], processed_filename)
+                
+                # Copy the file
+                shutil.copy2(video_source, processed_path)
+                
+                # Get file size
+                file_size = os.path.getsize(processed_path)
+                
+                return jsonify({
+                    'success': True,
+                    'job_id': unique_id,
+                    'output': result.stdout,
+                    'video_path': video_source,
+                    'download_url': f"/download/{processed_filename}",
+                    'file_size_mb': round(file_size / (1024*1024), 2),
+                    'timestamp': datetime.utcnow().isoformat()
+                }), 200
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': 'Script completed but no video file was created',
+                    'output': result.stdout,
+                    'stderr': result.stderr,
+                    'timestamp': datetime.utcnow().isoformat()
+                }), 500
         else:
             return jsonify({
                 'success': False,
@@ -270,12 +300,19 @@ def execute_script_webhook():
                 'timestamp': datetime.utcnow().isoformat()
             }), 500
 
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            'success': False,
+            'error': 'Script execution timed out (600 seconds)',
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
     except Exception as e:
         return jsonify({
             'success': False,
             'error': str(e),
             'timestamp': datetime.utcnow().isoformat()
         }), 500
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """
@@ -317,4 +354,3 @@ def internal_error(e):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
-    
